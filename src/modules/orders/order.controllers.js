@@ -1,6 +1,7 @@
 import { Order } from './order.model.js';
 import { Product } from '../products/product.model.js';
 import { Cart } from '../carts/cart.model.js';
+import { Coupon } from '../coupons/coupon.model.js';
 import mongoose from 'mongoose';
 
 function createValidationError(message) {
@@ -42,30 +43,108 @@ export const getOrderById = async (req, res, next) => {
 };
 
 export const createOrder = async (req, res, next) => {
-  const { total_amount, status, order_item } = req.body || {};
+  const SHIPPING_FEE = 50;
+  const { status, total_amount: clientTotal, coupon_code } = req.body || {};
 
-  if (
-    total_amount === undefined ||
-    !status ||
-    !Array.isArray(order_item) ||
-    order_item.length === 0
-  ) {
-    return next(
-      createValidationError('user_id, total_amount, status, order_item are required')
-    );
+  if (!status || clientTotal === undefined) {
+    return next(createValidationError('status and total_amount are required'));
   }
 
+  // 1. Fetch cart from DB — do not trust order_item from frontend
+  let cartItems;
+  try {
+    const cartDocs = await Cart.find({ user_id: req.user.users._id });
+    cartItems = cartDocs.flatMap((doc) => doc.cart_item);
+  } catch (err) {
+    return next(err);
+  }
+
+  if (cartItems.length === 0) {
+    return next(createValidationError('Cart is empty'));
+  }
+
+  // 2. Aggregate quantities per book_id
   const stockRequests = new Map();
+  for (const item of cartItems) {
+    const bookId = item.book_id.toString();
+    stockRequests.set(bookId, (stockRequests.get(bookId) || 0) + Number(item.quantity));
+  }
 
-  for (const item of order_item) {
-    const quantity = Number(item.quantity);
-    const bookId = item.book_id;
+  // 3. Fetch products from DB for price + discount info
+  let productMap;
+  try {
+    const bookIds = [...stockRequests.keys()];
+    const products = await Product.find({ _id: { $in: bookIds } });
 
-    if (!mongoose.Types.ObjectId.isValid(bookId) || quantity < 1) {
-      return next(createValidationError('Valid book_id and quantity are required'));
+    if (products.length !== bookIds.length) {
+      return next(createValidationError('One or more products not found'));
     }
 
-    stockRequests.set(bookId, (stockRequests.get(bookId) || 0) + quantity);
+    productMap = new Map(products.map((p) => [p._id.toString(), p]));
+  } catch (err) {
+    return next(err);
+  }
+
+  // 4. Build verified order items using DB data only
+  const verifiedOrderItems = cartItems.map((item) => {
+    const product = productMap.get(item.book_id.toString());
+    return {
+      book_id: product._id,
+      book_name: product.book_name,
+      author: product.author,
+      quantity: Number(item.quantity),
+      price: product.price,
+      img_link: product.img_link,
+      isDiscount: product.isDiscount,
+      discountPercent: product.discountPercent
+    };
+  });
+
+  // 5. Calculate subtotal + shipping server-side
+  const subtotal = verifiedOrderItems.reduce((sum, item) => {
+    const price = parseFloat(item.price.toString());
+    const discount = item.isDiscount ? item.discountPercent : 0;
+    return sum + price * (1 - discount / 100) * item.quantity;
+  }, 0);
+
+  let total_amount = subtotal + SHIPPING_FEE;
+
+  // 6. Validate and apply coupon if provided
+  let appliedCoupon = null;
+  if (coupon_code) {
+    try {
+      const coupon = await Coupon.findOne({ code: coupon_code.toUpperCase(), isActive: true });
+
+      if (!coupon) return next(createValidationError('Coupon not found or inactive'));
+      if (coupon.expiresAt < new Date()) return next(createValidationError('Coupon has expired'));
+      if (coupon.usageLimit && coupon.usedCount >= coupon.usageLimit)
+        return next(createValidationError('Coupon usage limit reached'));
+      if (subtotal < coupon.minOrderAmount)
+        return next(createValidationError(`Minimum order amount is ${coupon.minOrderAmount}`));
+
+      let discountAmount =
+        coupon.discountType === 'percentage'
+          ? (subtotal * coupon.discountValue) / 100
+          : coupon.discountValue;
+
+      if (coupon.discountType === 'percentage' && coupon.maxDiscountAmount) {
+        discountAmount = Math.min(discountAmount, coupon.maxDiscountAmount);
+      }
+
+      total_amount = Math.max(total_amount - discountAmount, 0);
+      appliedCoupon = coupon;
+    } catch (err) {
+      return next(err);
+    }
+  }
+
+  // 7. Verify backend total matches frontend preview — reject before touching stock
+  if (Math.abs(total_amount - Number(clientTotal)) > 0.01) {
+    return next(
+      createValidationError(
+        'Order total does not match. Prices may have changed — please refresh and try again.'
+      )
+    );
   }
 
   const decrementedStock = [];
@@ -78,12 +157,9 @@ export const createOrder = async (req, res, next) => {
       );
 
       if (result.modifiedCount === 0) {
-        const product = await Product.findById(bookId).select('book_name stock');
-        const bookName = product?.book_name || bookId;
-        const availableStock = product?.stock ?? 0;
-
+        const product = productMap.get(bookId);
         throw createValidationError(
-          `${bookName} has only ${availableStock} item(s) in stock`
+          `${product?.book_name || bookId} has only ${product?.stock ?? 0} item(s) in stock`
         );
       }
 
@@ -94,8 +170,12 @@ export const createOrder = async (req, res, next) => {
       user_id: req.user.users._id,
       total_amount,
       status,
-      order_item
+      order_item: verifiedOrderItems
     });
+
+    if (appliedCoupon) {
+      await Coupon.updateOne({ _id: appliedCoupon._id }, { $inc: { usedCount: 1 } });
+    }
 
     await Cart.deleteMany({ user_id: req.user.users._id });
 
